@@ -180,7 +180,7 @@ class MyBot(ExampleEngine):
             return score
 
         # --- plain minimax (no alpha-beta) ---
-        def minimax(b: chess.Board, depth: int, maximizing: bool) -> int:
+        """def minimax(b: chess.Board, depth: int, maximizing: bool) -> int:
             if depth == 0 or b.is_game_over():
                 return evaluate(b)
 
@@ -201,8 +201,32 @@ class MyBot(ExampleEngine):
                     b.pop()
                     if val < best:
                         best = val
-                return best
+                return best"""
 
+        def alphabeta(b: chess.Board, depth: int, alpha: int, beta: int, maximizing: bool) -> int:
+            if depth == 0 or b.is_game_over():
+                return evaluate(b)
+
+            if maximizing:
+                value = -10**12
+                for m in b.legal_moves:
+                    b.push(m)
+                    value = max(value, alphabeta(b, depth - 1, alpha, beta, False))
+                    b.pop()
+                    alpha = max(alpha, value)
+                    if alpha >= beta:
+                        break  # beta cutoff
+                return value
+            else:
+                value = 10**12
+                for m in b.legal_moves:
+                    b.push(m)
+                    value = min(value, alphabeta(b, depth - 1, alpha, beta, True))
+                    b.pop()
+                    beta = min(beta, value)
+                    if beta <= alpha:
+                        break  # alpha cutoff
+                return value
         # --- root move selection ---
         legal = list(board.legal_moves)
         if not legal:
@@ -216,7 +240,7 @@ class MyBot(ExampleEngine):
         # Lookahead depth chosen by the simple time heuristic; subtract one for the root move
         for m in legal:
             board.push(m)
-            val = minimax(board, total_depth - 1, not maximizing)
+            val = alphabeta(board, total_depth - 1, -10**12, 10**12, not maximizing)
             board.pop()
 
             if maximizing and val > best_eval:
@@ -230,7 +254,7 @@ class MyBot(ExampleEngine):
 
         return PlayResult(best_move, None)
 
-
+"""
 import chess
 import time
 import random
@@ -487,4 +511,4 @@ class MyBot(ExampleEngine):
         if best_move_found is None and list(board.legal_moves):
             best_move_found = random.choice(list(board.legal_moves))
 
-        return PlayResult(best_move_found, None)
+        return PlayResult(best_move_found, None)"""
