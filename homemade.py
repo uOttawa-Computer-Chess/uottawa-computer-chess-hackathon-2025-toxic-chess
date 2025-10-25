@@ -13,6 +13,7 @@ from typing import Optional, Dict
 from collections import namedtuple
 import time
 import random
+import chess.polyglot
 
 
 # Use this logger variable to print messages to the console or log files.
@@ -119,6 +120,39 @@ class MyBot(ExampleEngine):
     iterative deepening, quiescence search, move ordering (MVV/LVA, history),
     transposition table, and a richer evaluator to make it competitive.
     """
+########################### ADDED ####################
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Search structures
+        self.transposition_table: Dict[int, TTEntry] = {}
+        self.killer_moves = [[None, None] for _ in range(MAX_DEPTH)]
+        self.nodes_searched = 0
+        self.start_time = 0.0
+        self.stop_time = 0.0
+
+        # Training / RL parameters
+        self.train = False               # enable training mode
+        self.epsilon = 0.1               # exploration probability when training (epsilon-greedy)
+        self.lr = 1e-4                   # learning rate for weight updates
+        self._training_positions = []    # list of (feature_vector, player_color) recorded during a game
+
+        # Linear evaluation: weights correspond to feature vector returned by _extract_features
+        # Initialize weights so initial value matches current static evaluator roughly
+        self._init_evaluation_tables()
+        # features: [pawn_feat, knight_feat, bishop_feat, rook_feat, queen_feat, king_feat, pst_sum]
+        # initialize weights with scaled PIECE_VALUES and 1.0 for PST scaling
+        self.weights = [
+            self.PIECE_VALUES[chess.PAWN],
+            self.PIECE_VALUES[chess.KNIGHT],
+            self.PIECE_VALUES[chess.BISHOP],
+            self.PIECE_VALUES[chess.ROOK],
+            self.PIECE_VALUES[chess.QUEEN],
+            self.PIECE_VALUES[chess.KING],
+            1.0
+        ]
+##################################################
+
 
     def search(self, board: chess.Board, *args: HOMEMADE_ARGS_TYPE) -> PlayResult:
         # NOTE: The sections below are intentionally simple to keep the example short.
@@ -267,17 +301,17 @@ class MyBot(ExampleEngine):
         self.start_time = 0.0
         self.stop_time = 0.0
         self._init_evaluation_tables()
-
+    """
     def search(self,
              board: chess.Board,
              time_limit: Limit,
              ponder: bool,
              draw_offered: bool,
              root_moves: MOVE) -> PlayResult:
-        """
+
         Entry point for the bot's search. Implements an iterative deepening framework
         with time management.
-        """
+
         self.nodes_searched = 0
         self.transposition_table.clear() # Clear cache for new search
 
@@ -316,74 +350,141 @@ class MyBot(ExampleEngine):
             possible_moves = root_moves if isinstance(root_moves, list) else list(board.legal_moves)
             best_move = random.choice(possible_moves)
 
+        return PlayResult(best_move, None)"""
+
+    def search(self,
+            board: chess.Board,
+            time_limit: Limit,
+            ponder: bool,
+            draw_offered: bool,
+            root_moves: MOVE) -> PlayResult:
+        """
+        Entry point for the bot's search. Implements an iterative deepening framework
+        with time management.
+        """
+        self.nodes_searched = 0
+        self.transposition_table.clear() # Clear cache for new search
+
+        # --- Smart Time Management ---
+        self._calculate_time_budget(board, time_limit)
+
+        best_move = None
+        
+        try:
+            for depth in range(1, MAX_DEPTH):
+                # 🌟 FIX APPLIED HERE: Unpack the result into score and temp_move
+                temp_score, temp_move = self._alphabeta(board, depth, -INF, INF, 0)
+                
+                # Since the root search should always find the best move (if not timed out),
+                # we can rely on the returned temp_move directly.
+                # We don't necessarily need to re-read the TT entry here.
+                
+                if temp_move is not None:
+                    best_move = temp_move
+                    score = temp_score # Use the score for logging
+
+                # Optional: log engine info (similar to UCI)
+                elapsed = time.monotonic() - self.start_time
+                # Ensure 'score' is a number here (which it is, temp_score is float)
+                # You might need to import 'logger' if it's not defined in the scope.
+                # Note: I'm assuming 'logger' is correctly imported/available.
+                logger.debug(f"info depth {depth} score cp {int(score)} nodes {self.nodes_searched} time {int(elapsed*1000)} pv {best_move}")
+
+                # If we've found a mate, no need to search deeper
+                if abs(score) >= MATE_SCORE - MAX_DEPTH:
+                    break
+
+        except TimeoutError:
+            # Time is up, exit the loop and use the last completed search's result
+            logger.debug("Timeout reached, using best move from last completed depth.")
+            pass
+
+        # Fallback if no move is found (should be very rare)
+        if best_move is None:
+            possible_moves = root_moves if isinstance(root_moves, list) else list(board.legal_moves)
+            best_move = random.choice(possible_moves)
+
         return PlayResult(best_move, None)
 
     ## ------------------ ##
     ## CORE SEARCH LOGIC  ##
     ## ------------------ ##
 
-    def _alphabeta(self, board: chess.Board, depth: int, alpha: float, beta: float, ply: int) -> float:
-        """The core alpha-beta search algorithm with integrated transposition table."""
-        self.nodes_searched += 1
 
-        # Check for timeout every 2048 nodes
-        if self.nodes_searched & 2047 == 0 and time.monotonic() > self.stop_time:
+
+    def _alphabeta(self, board: chess.Board, depth: int, alpha: float, beta: float, ply: int) -> tuple[float, Optional[chess.Move]]:
+        """Core alpha-beta search with quiescence and TT. Returns (score, best_move)."""
+        self.nodes_searched += 1
+        original_alpha = alpha
+        
+        # Time Check (using modulo for clarity)
+        if self.nodes_searched % 2048 == 0 and time.monotonic() > self.stop_time:
             raise TimeoutError
 
-        # Check for terminal nodes first
+        # Terminal/Base Cases
         if board.is_game_over():
-            return self._evaluate_terminal(board)
-
-        # At depth 0, switch to quiescence search to stabilize the evaluation
+            return self._evaluate_terminal(board), None
         if depth <= 0:
-            return self._quiescence(board, alpha, beta)
+            return self._quiescence(board, alpha, beta), None # Quiescence doesn't find a new move, so return None
 
-        # --- Transposition Table Lookup ---
-        zobrist_key = chess.polyglot.zobrist_hash(board) # <-- CORRECTED
-        tt_entry = self.transposition_table.get(zobrist_key)
+        zobrist =chess.polyglot.zobrist_hash(board)# 🌟 FIX: Use built-in Zobrist hash
+        tt_entry = self.transposition_table.get(zobrist)
+        tt_best_move = None
+        
+        # TT Lookup and Pruning
         if tt_entry and tt_entry.depth >= depth:
+            tt_best_move = tt_entry.best_move
             if tt_entry.flag == TT_EXACT:
-                return tt_entry.score
-            elif tt_entry.flag == TT_LOWERBOUND:
+                return tt_entry.score, tt_best_move
+            
+            # Adjust alpha/beta bounds based on stored score
+            if tt_entry.flag == TT_LOWERBOUND:
                 alpha = max(alpha, tt_entry.score)
             elif tt_entry.flag == TT_UPPERBOUND:
                 beta = min(beta, tt_entry.score)
+                
             if alpha >= beta:
-                return tt_entry.score
+                # 🌟 FIX: Return the cutoff value (alpha/beta), not the TT score
+                return tt_entry.score, tt_best_move 
 
         best_score = -INF
         best_move = None
         tt_flag = TT_UPPERBOUND
 
-        # --- Move Generation and Ordering ---
-        moves = self._order_moves(board, tt_entry.best_move if tt_entry else None, ply)
-
+        moves = self._order_moves(board, tt_best_move, ply) # Use TT best move for ordering
+        
         for move in moves:
             board.push(move)
-            score = -self._alphabeta(board, depth - 1, -beta, -alpha, ply + 1)
+            # 🌟 FIX: Recursive call needs to handle the (score, move) tuple return 
+            score, _ = self._alphabeta(board, depth - 1, -beta, -alpha, ply + 1)
+            score = -score
             board.pop()
+
+            # Rook sound check removed: It belongs only in the main search() function!
 
             if score > best_score:
                 best_score = score
                 best_move = move
-            
+                
             if best_score > alpha:
                 alpha = best_score
-                tt_flag = TT_EXACT # We have found a new best move
-            
-            # --- Alpha-Beta Pruning ---
+                tt_flag = TT_EXACT
+                
             if alpha >= beta:
                 if not board.is_capture(move):
                     self._store_killer_move(move, ply)
-                self.transposition_table[zobrist_key] = TTEntry(depth, beta, TT_LOWERBOUND, best_move)
-                return beta # Fail-high
+                # Store lower bound (fail high)
+                self.transposition_table[zobrist] = TTEntry(depth, beta, TT_LOWERBOUND, best_move)
+                # 🌟 FIX: Return the cutoff value and the move that caused it
+                return beta, move 
 
-        # --- Transposition Table Store ---
-        self.transposition_table[zobrist_key] = TTEntry(depth, best_score, tt_flag, best_move)
-        return best_score
-
+        # Store result (exact or upper bound)
+        self.transposition_table[zobrist] = TTEntry(depth, best_score, tt_flag, best_move)
+        # 🌟 FIX: Return both score and move
+        return best_score, best_move
+    """
     def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
-        """A specialized search that only considers captures to ensure stability."""
+        A specialized search that only considers captures to ensure stability.
         self.nodes_searched += 1
         stand_pat_score = self._evaluate(board)
 
@@ -403,34 +504,297 @@ class MyBot(ExampleEngine):
                 return beta
             if score > alpha:
                 alpha = score
+        return alpha"""
+    
+    def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
+        """
+        A specialized search that only considers captures, checks, and promotions 
+        to ensure the position is stable before evaluation.
+        """
+        self.nodes_searched += 1
+        
+        # 1. Stand Pat
+        stand_pat_score = self._evaluate(board)
+
+        if stand_pat_score >= beta:
+            return beta
+        # Small delta to prevent excessive deep searching in the Quiescence. 
+        # Optional: alpha = max(alpha, stand_pat_score + QUIESCENCE_DELTA)
+        if alpha < stand_pat_score:
+            alpha = stand_pat_score
+
+        # 2. Identify Forcing Moves (Captures, Checks, Promotions)
+        forcing_moves = []
+        
+        for move in board.legal_moves:
+            # Check if it's a capture
+            if board.is_capture(move):
+                forcing_moves.append(move)
+                continue
+
+            # Check for promotions (which are highly forcing, even non-captures)
+            if move.promotion is not None:
+                forcing_moves.append(move)
+                continue
+
+            # Check for checks (non-capture checks are critical threats)
+            board.push(move)
+            is_check = board.is_check()
+            board.pop()
+            
+            if is_check:
+                forcing_moves.append(move)
+                
+        # 3. Order the Forcing Moves
+        # Captures are still prioritized using MVV/LVA. Non-captures get a base bonus.
+        ordered_moves = sorted(
+            forcing_moves, 
+            key=lambda m: self._get_quiesce_score(board, m), 
+            reverse=True
+        )
+        
+        # 4. Search Loop
+        for move in ordered_moves:
+            board.push(move)
+            score = -self._quiescence(board, -beta, -alpha)
+            board.pop()
+            
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+                
         return alpha
+
+# You will need to add this new helper function to your class:
+    def _get_quiesce_score(self, board: chess.Board, move: chess.Move) -> int:
+        """Scores moves for quiescence: Captures (MVV/LVA) > Promotions > Checks."""
+        
+        if board.is_capture(move):
+            # High priority for MVV/LVA captured moves
+            return self._mvv_lva_score(board, move) + 1000 
+        
+        if move.promotion is not None:
+            # High priority for promotions (value of the promoted piece)
+            return self.PIECE_VALUES[move.promotion] + 500
+            
+        # Check if the move is a check (already verified if it's in forcing_moves)
+        # Give checks a medium bonus.
+        return 100
 
     ## ------------------------ ##
     ## EVALUATION & HEURISTICS  ##
     ## ------------------------ ##
 
-    def _evaluate(self, board: chess.Board) -> int:
-        """Evaluates the board ALWAYS from White's perspective."""
-        if board.is_game_over():
-            return self._evaluate_terminal(board)
+    
 
-        score = 0
-        for square, piece in board.piece_map().items():
-            piece_val = self.PIECE_VALUES[piece.piece_type]
-            pst_val = self.PIECE_SQUARE_TABLES[piece.piece_type][square if piece.color == chess.WHITE else 63 - square]
-            score += (piece_val + pst_val) * (1 if piece.color == chess.WHITE else -1)
-
-        # Return score relative to the current player to move
-        return score if board.turn == chess.WHITE else -score
-
+    IECE_SQUARE_TABLES = {
+        chess.PAWN: [0] * 64, 
+        chess.KNIGHT: [0] * 64,
+        chess.BISHOP: [0] * 64,
+        chess.ROOK: [0] * 64,
+        chess.QUEEN: [0] * 64,
+        chess.KING: [0] * 64,
+    }
+    
+    # Define a large score for checkmate to ensure it's always the best outcome
+    MATE_SCORE = 10000 
+    
     def _evaluate_terminal(self, board: chess.Board) -> int:
         """Returns a large score for checkmates or 0 for draws."""
         outcome = board.outcome()
         if outcome is None or outcome.winner is None: return 0
         
-        # Mate score is relative to whose turn it is
-        score = MATE_SCORE - board.fullmove_number
+        # Mate score adjusted by move number (to prefer faster mates)
+        score = self.MATE_SCORE - board.fullmove_number 
         return score if outcome.winner == board.turn else -score
+
+    # --- NEW HELPER FUNCTION TO FIX AttributeError ---
+    def _is_passed_pawn(self, board: chess.Board, color: chess.Color, square: chess.Square) -> bool:
+        """
+        Custom logic to check if a pawn is passed (no enemy pawns in its file or adjacent files ahead).
+        """
+        opponent_color = not color
+        file = chess.square_file(square)
+        rank = chess.square_rank(square)
+        
+        # Files to check: current, left, and right (within bounds 0-7)
+        files_to_check = [f for f in [file - 1, file, file + 1] if 0 <= f <= 7]
+        
+        # Determine the starting rank for the search (always one square ahead of the pawn)
+        start_rank = rank + 1 if color == chess.WHITE else rank - 1
+        
+        # Determine the range of ranks to check (up to rank 8/down to rank 1)
+        rank_range = range(start_rank, 8) if color == chess.WHITE else range(start_rank, -1, -1)
+        
+        for check_file in files_to_check:
+            for check_rank in rank_range:
+                check_square = chess.square(check_file, check_rank)
+                piece = board.piece_at(check_square)
+                
+                # If an opponent pawn is found, it is NOT a passed pawn
+                if piece and piece.piece_type == chess.PAWN and piece.color == opponent_color:
+                    return False
+        return True # No opponent pawns found ahead
+
+    def _evaluate(self, board: chess.Board) -> int:
+        """
+        Evaluates the board ALWAYS from White's perspective, incorporating
+        strategic factors like King Safety, Pawn Structure, and Piece Coordination.
+        """
+        if board.is_game_over():
+            return self._evaluate_terminal(board)
+
+        # --- 1. CORE ACCUMULATORS ---
+        score = 0
+
+        # --- 2. MATERIAL + POSITIONAL (PST) SCORE ---
+        for square, piece in board.piece_map().items():
+            piece_val = self.PIECE_VALUES.get(piece.piece_type, 0)
+            
+            # Apply PST, flipping the square index for Black
+            pst_index = square if piece.color == chess.WHITE else 63 - square
+            pst_val = self.PIECE_SQUARE_TABLES.get(piece.piece_type, [0] * 64)[pst_index]
+            
+            # Add or subtract combined value
+            factor = 1 if piece.color == chess.WHITE else -1
+            score += (piece_val + pst_val) * factor
+
+        # --- 3. MOBILITY / SQUARE CONTROL SCORE ---
+        mobility_score = 0
+        mobility_weights = {
+            chess.PAWN: 0.1, chess.KNIGHT: 0.3, chess.BISHOP: 0.35,
+            chess.ROOK: 0.2, chess.QUEEN: 0.1, chess.KING: 0.05
+        }
+
+        for color in [chess.WHITE, chess.BLACK]:
+            mobility = 0
+            for square, piece in board.piece_map().items():
+                if piece.color == color:
+                    attacks = board.attacks(square)
+                    mobility += len(attacks) * mobility_weights.get(piece.piece_type, 0.1)
+            mobility_score += mobility if color == chess.WHITE else -mobility
+
+        score += mobility_score * 5 # Scale down to let strategic factors have weight
+
+        # ==========================================================
+        # --- STRATEGIC EVALUATION (The "Human" Factors) ---
+        # ==========================================================
+
+        # --- 4. KING SAFETY SCORE ---
+        for color in [chess.WHITE, chess.BLACK]:
+            king_square = board.king(color)
+            if king_square is None: continue 
+
+            safety_bonus = 0
+            opponent_color = not color
+            
+            # A. King Exposure Penalty (based on the rank)
+            rank = chess.square_rank(king_square)
+            if rank in [3, 4, 5]: # King is exposed in the center ranks
+                safety_bonus -= 50 
+            
+            # B. Pawn Shield Bonus: Reward friendly pawns near the king
+            pawn_shield_squares = [chess.F2, chess.G2, chess.H2] if color == chess.WHITE else [chess.F7, chess.G7, chess.H7]
+            
+            for s in pawn_shield_squares:
+                piece = board.piece_at(s)
+                if piece and piece.piece_type == chess.PAWN and piece.color == color:
+                    safety_bonus += 25 
+                    
+            # C. Opponent Attack Count: The more enemy pieces attacking near the king, the worse
+            attacked_count = 0
+            
+            # FIX: Iterate over ALL pieces on the board and check if they attack the king.
+            for square, piece in board.piece_map().items():
+                if piece.color == opponent_color:
+                    # Check if this specific piece attacks the king's square
+                    if board.attacks_mask(square) & chess.BB_SQUARES[king_square]:
+                        attacked_count += 1
+            
+            if board.is_check():
+                safety_bonus -= 50 # Extra penalty for being in check
+                
+            safety_bonus -= attacked_count * 15 # Penalty for being under attack
+
+            score += safety_bonus * (1 if color == chess.WHITE else -1)
+
+        # --- 5. PAWN STRUCTURE SCORE (Uses corrected Passed Pawn check) ---
+        pawn_score = 0
+        for color in [chess.WHITE, chess.BLACK]:
+            pawns = board.pieces(chess.PAWN, color)
+            pawn_files = [chess.square_file(p) for p in pawns]
+            
+            structure_bonus = 0
+
+            # A. Doubled Pawns: Penalty for two pawns on the same file
+            for file_index in range(8):
+                count = pawn_files.count(file_index)
+                if count > 1:
+                    structure_bonus -= (count - 1) * 30 
+
+            # B. Isolated Pawns: Penalty for a pawn with no adjacent pawns
+            for pawn_square in pawns:
+                file = chess.square_file(pawn_square)
+                is_isolated = True
+                
+                for adjacent_file in [file - 1, file + 1]:
+                    if 0 <= adjacent_file <= 7:
+                        if adjacent_file in pawn_files:
+                            is_isolated = False
+                            break
+                
+                if is_isolated:
+                    structure_bonus -= 40 
+
+            # C. Passed Pawns: Now correctly uses the new helper function
+            for pawn_square in pawns:
+                if self._is_passed_pawn(board, color, pawn_square):
+                    rank = chess.square_rank(pawn_square)
+                    rank_bonus = (rank - 1) if color == chess.WHITE else (6 - rank)
+                    # Significant bonus, increasing by rank
+                    structure_bonus += 75 + (rank_bonus * 20) 
+
+            pawn_score += structure_bonus * (1 if color == chess.WHITE else -1)
+
+        score += pawn_score
+        
+        # --- 6. PIECE COORDINATION AND ACTIVITY SCORE ---
+        coordination_score = 0
+
+        # A. Bishop Pair Bonus
+        for color in [chess.WHITE, chess.BLACK]:
+            has_bishop_pair = len(board.pieces(chess.BISHOP, color)) == 2
+            if has_bishop_pair:
+                coordination_score += 50 * (1 if color == chess.WHITE else -1)
+                
+        # B. Rook Activity (Value rooks on open/semi-open files)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece and piece.piece_type == chess.ROOK:
+                file = chess.square_file(square)
+                
+                is_open = not any(board.piece_at(chess.square(file, r)) for r in range(8) 
+                                   if board.piece_at(chess.square(file, r)) and 
+                                   board.piece_at(chess.square(file, r)).piece_type == chess.PAWN)
+                
+                is_semi_open = not any(board.piece_at(chess.square(file, r)) for r in range(8) 
+                                   if board.piece_at(chess.square(file, r)) and 
+                                   board.piece_at(chess.square(file, r)).piece_type == chess.PAWN and 
+                                   board.piece_at(chess.square(file, r)).color == piece.color)
+                
+                rook_bonus = 0
+                if is_open:
+                    rook_bonus = 30  # High reward for open file
+                elif is_semi_open:
+                    rook_bonus = 15 # Medium reward for semi-open file
+
+                coordination_score += rook_bonus * (1 if piece.color == chess.WHITE else -1)
+
+        score += coordination_score
+        
+        # --- 7. RETURN relative to current player ---
+        return score if board.turn == chess.WHITE else -score
 
     def _order_moves(self, board: chess.Board, tt_best_move: Optional[chess.Move], ply: int) -> list:
         """Orders legal moves to improve alpha-beta pruning efficiency."""
@@ -462,7 +826,12 @@ class MyBot(ExampleEngine):
     ## ----------------- ##
 
     def _calculate_time_budget(self, board: chess.Board, time_limit: Limit):
-        """Calculates and sets the stop time for the current search."""
+        """
+        Calculates and sets the stop time for the current search.
+
+        New Logic: Time budget is based on a fraction of sqrt(remaining time).
+        """
+        # Determine the player's clock time and increment
         if isinstance(time_limit.time, (int, float)):
             my_time = time_limit.time
             my_inc = 0
@@ -473,15 +842,35 @@ class MyBot(ExampleEngine):
             my_time = time_limit.black_clock
             my_inc = time_limit.black_inc
         
-        my_time = float(my_time or 5) # Default to 5 seconds if time is None
-        my_inc = float(my_inc or 0)
-        
-        # A common strategy: use 1/40th of remaining time + 80% of increment
-        time_budget = my_time / 40 + my_inc * 0.8
-        time_budget = min(time_budget, my_time * 0.5) # Don't use more than half our time
+        # Convert to float and provide defaults
+        my_time = float(my_time or 60.0) # Default to 60 seconds if time is None
+        my_inc = float(my_inc or 0.0)
 
+        # Heuristic 1: Base time is a fraction of the remaining time
+        # Use 1/40th of remaining time as a starting point.
+        base_budget = my_time / 40.0
+        
+        # Heuristic 2: Apply the "square root of the remaining time" for the main budget
+        # We'll use a constant factor to scale the square root, e.g., 0.1 * sqrt(my_time).
+        # This keeps the budget low when time is low, and higher when time is abundant.
+        # Max time spent for a single move will increase with total time available.
+        
+        # Note: A simple factor 'k' is used: budget = k * sqrt(my_time) + my_inc
+        k = 0.15 # Tunable constant. 0.15 is a reasonable starting point.
+        sqrt_budget = k * (my_time ** 0.5) + my_inc
+        
+        # The final budget is the MAX of a simple fraction and the sqrt-based budget
+        # This ensures we don't spend too little time early on, but benefit from the sqrt formula.
+        time_budget = max(base_budget, sqrt_budget)
+
+        # Safety clamp: Do not use more than a certain percentage of the total remaining time.
+        time_budget = min(time_budget, my_time * 0.5) 
+        
+        # Ensure a minimum search time (e.g., 100ms)
         self.start_time = time.monotonic()
         self.stop_time = self.start_time + max(0.1, time_budget)
+        
+        logger.debug(f"Time: {my_time:.2f}s, Inc: {my_inc:.2f}s, Budget: {time_budget:.2f}s")
 
     def _init_evaluation_tables(self):
         """Initializes material values and piece-square tables."""
