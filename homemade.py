@@ -13,6 +13,7 @@ from typing import Optional, Dict
 from collections import namedtuple
 import time
 import random
+import chess.polyglot
 
 
 # Use this logger variable to print messages to the console or log files.
@@ -300,17 +301,17 @@ class MyBot(ExampleEngine):
         self.start_time = 0.0
         self.stop_time = 0.0
         self._init_evaluation_tables()
-
+    """
     def search(self,
              board: chess.Board,
              time_limit: Limit,
              ponder: bool,
              draw_offered: bool,
              root_moves: MOVE) -> PlayResult:
-        """
+
         Entry point for the bot's search. Implements an iterative deepening framework
         with time management.
-        """
+
         self.nodes_searched = 0
         self.transposition_table.clear() # Clear cache for new search
 
@@ -349,71 +350,138 @@ class MyBot(ExampleEngine):
             possible_moves = root_moves if isinstance(root_moves, list) else list(board.legal_moves)
             best_move = random.choice(possible_moves)
 
+        return PlayResult(best_move, None)"""
+
+    def search(self,
+            board: chess.Board,
+            time_limit: Limit,
+            ponder: bool,
+            draw_offered: bool,
+            root_moves: MOVE) -> PlayResult:
+        """
+        Entry point for the bot's search. Implements an iterative deepening framework
+        with time management.
+        """
+        self.nodes_searched = 0
+        self.transposition_table.clear() # Clear cache for new search
+
+        # --- Smart Time Management ---
+        self._calculate_time_budget(board, time_limit)
+
+        best_move = None
+        
+        try:
+            for depth in range(1, MAX_DEPTH):
+                # 🌟 FIX APPLIED HERE: Unpack the result into score and temp_move
+                temp_score, temp_move = self._alphabeta(board, depth, -INF, INF, 0)
+                
+                # Since the root search should always find the best move (if not timed out),
+                # we can rely on the returned temp_move directly.
+                # We don't necessarily need to re-read the TT entry here.
+                
+                if temp_move is not None:
+                    best_move = temp_move
+                    score = temp_score # Use the score for logging
+
+                # Optional: log engine info (similar to UCI)
+                elapsed = time.monotonic() - self.start_time
+                # Ensure 'score' is a number here (which it is, temp_score is float)
+                # You might need to import 'logger' if it's not defined in the scope.
+                # Note: I'm assuming 'logger' is correctly imported/available.
+                logger.debug(f"info depth {depth} score cp {int(score)} nodes {self.nodes_searched} time {int(elapsed*1000)} pv {best_move}")
+
+                # If we've found a mate, no need to search deeper
+                if abs(score) >= MATE_SCORE - MAX_DEPTH:
+                    break
+
+        except TimeoutError:
+            # Time is up, exit the loop and use the last completed search's result
+            logger.debug("Timeout reached, using best move from last completed depth.")
+            pass
+
+        # Fallback if no move is found (should be very rare)
+        if best_move is None:
+            possible_moves = root_moves if isinstance(root_moves, list) else list(board.legal_moves)
+            best_move = random.choice(possible_moves)
+
         return PlayResult(best_move, None)
 
     ## ------------------ ##
     ## CORE SEARCH LOGIC  ##
     ## ------------------ ##
 
-    def _alphabeta(self, board: chess.Board, depth: int, alpha: float, beta: float, ply: int) -> float:
-        """The core alpha-beta search algorithm with integrated transposition table."""
-        self.nodes_searched += 1
 
-        # Check for timeout every 2048 nodes
-        if self.nodes_searched & 2047 == 0 and time.monotonic() > self.stop_time:
+
+    def _alphabeta(self, board: chess.Board, depth: int, alpha: float, beta: float, ply: int) -> tuple[float, Optional[chess.Move]]:
+        """Core alpha-beta search with quiescence and TT. Returns (score, best_move)."""
+        self.nodes_searched += 1
+        original_alpha = alpha
+        
+        # Time Check (using modulo for clarity)
+        if self.nodes_searched % 2048 == 0 and time.monotonic() > self.stop_time:
             raise TimeoutError
 
-        # Check for terminal nodes first
+        # Terminal/Base Cases
         if board.is_game_over():
-            return self._evaluate_terminal(board)
-
-        # At depth 0, switch to quiescence search to stabilize the evaluation
+            return self._evaluate_terminal(board), None
         if depth <= 0:
-            return self._quiescence(board, alpha, beta)
+            return self._quiescence(board, alpha, beta), None # Quiescence doesn't find a new move, so return None
 
-        # --- Transposition Table Lookup ---
-        zobrist_key = chess.polyglot.zobrist_hash(board) # <-- CORRECTED
-        tt_entry = self.transposition_table.get(zobrist_key)
+        zobrist =chess.polyglot.zobrist_hash(board)# 🌟 FIX: Use built-in Zobrist hash
+        tt_entry = self.transposition_table.get(zobrist)
+        tt_best_move = None
+        
+        # TT Lookup and Pruning
         if tt_entry and tt_entry.depth >= depth:
+            tt_best_move = tt_entry.best_move
             if tt_entry.flag == TT_EXACT:
-                return tt_entry.score
-            elif tt_entry.flag == TT_LOWERBOUND:
+                return tt_entry.score, tt_best_move
+            
+            # Adjust alpha/beta bounds based on stored score
+            if tt_entry.flag == TT_LOWERBOUND:
                 alpha = max(alpha, tt_entry.score)
             elif tt_entry.flag == TT_UPPERBOUND:
                 beta = min(beta, tt_entry.score)
+                
             if alpha >= beta:
-                return tt_entry.score
+                # 🌟 FIX: Return the cutoff value (alpha/beta), not the TT score
+                return tt_entry.score, tt_best_move 
 
         best_score = -INF
         best_move = None
         tt_flag = TT_UPPERBOUND
 
-        # --- Move Generation and Ordering ---
-        moves = self._order_moves(board, tt_entry.best_move if tt_entry else None, ply)
-
+        moves = self._order_moves(board, tt_best_move, ply) # Use TT best move for ordering
+        
         for move in moves:
             board.push(move)
-            score = -self._alphabeta(board, depth - 1, -beta, -alpha, ply + 1)
+            # 🌟 FIX: Recursive call needs to handle the (score, move) tuple return 
+            score, _ = self._alphabeta(board, depth - 1, -beta, -alpha, ply + 1)
+            score = -score
             board.pop()
+
+            # Rook sound check removed: It belongs only in the main search() function!
 
             if score > best_score:
                 best_score = score
                 best_move = move
-            
+                
             if best_score > alpha:
                 alpha = best_score
-                tt_flag = TT_EXACT # We have found a new best move
-            
-            # --- Alpha-Beta Pruning ---
+                tt_flag = TT_EXACT
+                
             if alpha >= beta:
                 if not board.is_capture(move):
                     self._store_killer_move(move, ply)
-                self.transposition_table[zobrist_key] = TTEntry(depth, beta, TT_LOWERBOUND, best_move)
-                return beta # Fail-high
+                # Store lower bound (fail high)
+                self.transposition_table[zobrist] = TTEntry(depth, beta, TT_LOWERBOUND, best_move)
+                # 🌟 FIX: Return the cutoff value and the move that caused it
+                return beta, move 
 
-        # --- Transposition Table Store ---
-        self.transposition_table[zobrist_key] = TTEntry(depth, best_score, tt_flag, best_move)
-        return best_score
+        # Store result (exact or upper bound)
+        self.transposition_table[zobrist] = TTEntry(depth, best_score, tt_flag, best_move)
+        # 🌟 FIX: Return both score and move
+        return best_score, best_move
     """
     def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
         A specialized search that only considers captures to ensure stability.
