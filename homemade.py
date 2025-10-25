@@ -442,28 +442,215 @@ class MyBot(ExampleEngine):
     ## EVALUATION & HEURISTICS  ##
     ## ------------------------ ##
 
-    def _evaluate(self, board: chess.Board) -> int:
-        """Evaluates the board ALWAYS from White's perspective."""
-        if board.is_game_over():
-            return self._evaluate_terminal(board)
+    
 
-        score = 0
-        for square, piece in board.piece_map().items():
-            piece_val = self.PIECE_VALUES[piece.piece_type]
-            pst_val = self.PIECE_SQUARE_TABLES[piece.piece_type][square if piece.color == chess.WHITE else 63 - square]
-            score += (piece_val + pst_val) * (1 if piece.color == chess.WHITE else -1)
-
-        # Return score relative to the current player to move
-        return score if board.turn == chess.WHITE else -score
-
+    IECE_SQUARE_TABLES = {
+        chess.PAWN: [0] * 64, 
+        chess.KNIGHT: [0] * 64,
+        chess.BISHOP: [0] * 64,
+        chess.ROOK: [0] * 64,
+        chess.QUEEN: [0] * 64,
+        chess.KING: [0] * 64,
+    }
+    
+    # Define a large score for checkmate to ensure it's always the best outcome
+    MATE_SCORE = 10000 
+    
     def _evaluate_terminal(self, board: chess.Board) -> int:
         """Returns a large score for checkmates or 0 for draws."""
         outcome = board.outcome()
         if outcome is None or outcome.winner is None: return 0
         
-        # Mate score is relative to whose turn it is
-        score = MATE_SCORE - board.fullmove_number
+        # Mate score adjusted by move number (to prefer faster mates)
+        score = self.MATE_SCORE - board.fullmove_number 
         return score if outcome.winner == board.turn else -score
+
+    # --- NEW HELPER FUNCTION TO FIX AttributeError ---
+    def _is_passed_pawn(self, board: chess.Board, color: chess.Color, square: chess.Square) -> bool:
+        """
+        Custom logic to check if a pawn is passed (no enemy pawns in its file or adjacent files ahead).
+        """
+        opponent_color = not color
+        file = chess.square_file(square)
+        rank = chess.square_rank(square)
+        
+        # Files to check: current, left, and right (within bounds 0-7)
+        files_to_check = [f for f in [file - 1, file, file + 1] if 0 <= f <= 7]
+        
+        # Determine the starting rank for the search (always one square ahead of the pawn)
+        start_rank = rank + 1 if color == chess.WHITE else rank - 1
+        
+        # Determine the range of ranks to check (up to rank 8/down to rank 1)
+        rank_range = range(start_rank, 8) if color == chess.WHITE else range(start_rank, -1, -1)
+        
+        for check_file in files_to_check:
+            for check_rank in rank_range:
+                check_square = chess.square(check_file, check_rank)
+                piece = board.piece_at(check_square)
+                
+                # If an opponent pawn is found, it is NOT a passed pawn
+                if piece and piece.piece_type == chess.PAWN and piece.color == opponent_color:
+                    return False
+        return True # No opponent pawns found ahead
+
+    def _evaluate(self, board: chess.Board) -> int:
+        """
+        Evaluates the board ALWAYS from White's perspective, incorporating
+        strategic factors like King Safety, Pawn Structure, and Piece Coordination.
+        """
+        if board.is_game_over():
+            return self._evaluate_terminal(board)
+
+        # --- 1. CORE ACCUMULATORS ---
+        score = 0
+
+        # --- 2. MATERIAL + POSITIONAL (PST) SCORE ---
+        for square, piece in board.piece_map().items():
+            piece_val = self.PIECE_VALUES.get(piece.piece_type, 0)
+            
+            # Apply PST, flipping the square index for Black
+            pst_index = square if piece.color == chess.WHITE else 63 - square
+            pst_val = self.PIECE_SQUARE_TABLES.get(piece.piece_type, [0] * 64)[pst_index]
+            
+            # Add or subtract combined value
+            factor = 1 if piece.color == chess.WHITE else -1
+            score += (piece_val + pst_val) * factor
+
+        # --- 3. MOBILITY / SQUARE CONTROL SCORE ---
+        mobility_score = 0
+        mobility_weights = {
+            chess.PAWN: 0.1, chess.KNIGHT: 0.3, chess.BISHOP: 0.35,
+            chess.ROOK: 0.2, chess.QUEEN: 0.1, chess.KING: 0.05
+        }
+
+        for color in [chess.WHITE, chess.BLACK]:
+            mobility = 0
+            for square, piece in board.piece_map().items():
+                if piece.color == color:
+                    attacks = board.attacks(square)
+                    mobility += len(attacks) * mobility_weights.get(piece.piece_type, 0.1)
+            mobility_score += mobility if color == chess.WHITE else -mobility
+
+        score += mobility_score * 5 # Scale down to let strategic factors have weight
+
+        # ==========================================================
+        # --- STRATEGIC EVALUATION (The "Human" Factors) ---
+        # ==========================================================
+
+        # --- 4. KING SAFETY SCORE ---
+        for color in [chess.WHITE, chess.BLACK]:
+            king_square = board.king(color)
+            if king_square is None: continue 
+
+            safety_bonus = 0
+            opponent_color = not color
+            
+            # A. King Exposure Penalty (based on the rank)
+            rank = chess.square_rank(king_square)
+            if rank in [3, 4, 5]: # King is exposed in the center ranks
+                safety_bonus -= 50 
+            
+            # B. Pawn Shield Bonus: Reward friendly pawns near the king
+            pawn_shield_squares = [chess.F2, chess.G2, chess.H2] if color == chess.WHITE else [chess.F7, chess.G7, chess.H7]
+            
+            for s in pawn_shield_squares:
+                piece = board.piece_at(s)
+                if piece and piece.piece_type == chess.PAWN and piece.color == color:
+                    safety_bonus += 25 
+                    
+            # C. Opponent Attack Count: The more enemy pieces attacking near the king, the worse
+            attacked_count = 0
+            
+            # FIX: Iterate over ALL pieces on the board and check if they attack the king.
+            for square, piece in board.piece_map().items():
+                if piece.color == opponent_color:
+                    # Check if this specific piece attacks the king's square
+                    if board.attacks_mask(square) & chess.BB_SQUARES[king_square]:
+                        attacked_count += 1
+            
+            if board.is_check():
+                safety_bonus -= 50 # Extra penalty for being in check
+                
+            safety_bonus -= attacked_count * 15 # Penalty for being under attack
+
+            score += safety_bonus * (1 if color == chess.WHITE else -1)
+
+        # --- 5. PAWN STRUCTURE SCORE (Uses corrected Passed Pawn check) ---
+        pawn_score = 0
+        for color in [chess.WHITE, chess.BLACK]:
+            pawns = board.pieces(chess.PAWN, color)
+            pawn_files = [chess.square_file(p) for p in pawns]
+            
+            structure_bonus = 0
+
+            # A. Doubled Pawns: Penalty for two pawns on the same file
+            for file_index in range(8):
+                count = pawn_files.count(file_index)
+                if count > 1:
+                    structure_bonus -= (count - 1) * 30 
+
+            # B. Isolated Pawns: Penalty for a pawn with no adjacent pawns
+            for pawn_square in pawns:
+                file = chess.square_file(pawn_square)
+                is_isolated = True
+                
+                for adjacent_file in [file - 1, file + 1]:
+                    if 0 <= adjacent_file <= 7:
+                        if adjacent_file in pawn_files:
+                            is_isolated = False
+                            break
+                
+                if is_isolated:
+                    structure_bonus -= 40 
+
+            # C. Passed Pawns: Now correctly uses the new helper function
+            for pawn_square in pawns:
+                if self._is_passed_pawn(board, color, pawn_square):
+                    rank = chess.square_rank(pawn_square)
+                    rank_bonus = (rank - 1) if color == chess.WHITE else (6 - rank)
+                    # Significant bonus, increasing by rank
+                    structure_bonus += 75 + (rank_bonus * 20) 
+
+            pawn_score += structure_bonus * (1 if color == chess.WHITE else -1)
+
+        score += pawn_score
+        
+        # --- 6. PIECE COORDINATION AND ACTIVITY SCORE ---
+        coordination_score = 0
+
+        # A. Bishop Pair Bonus
+        for color in [chess.WHITE, chess.BLACK]:
+            has_bishop_pair = len(board.pieces(chess.BISHOP, color)) == 2
+            if has_bishop_pair:
+                coordination_score += 50 * (1 if color == chess.WHITE else -1)
+                
+        # B. Rook Activity (Value rooks on open/semi-open files)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece and piece.piece_type == chess.ROOK:
+                file = chess.square_file(square)
+                
+                is_open = not any(board.piece_at(chess.square(file, r)) for r in range(8) 
+                                   if board.piece_at(chess.square(file, r)) and 
+                                   board.piece_at(chess.square(file, r)).piece_type == chess.PAWN)
+                
+                is_semi_open = not any(board.piece_at(chess.square(file, r)) for r in range(8) 
+                                   if board.piece_at(chess.square(file, r)) and 
+                                   board.piece_at(chess.square(file, r)).piece_type == chess.PAWN and 
+                                   board.piece_at(chess.square(file, r)).color == piece.color)
+                
+                rook_bonus = 0
+                if is_open:
+                    rook_bonus = 30  # High reward for open file
+                elif is_semi_open:
+                    rook_bonus = 15 # Medium reward for semi-open file
+
+                coordination_score += rook_bonus * (1 if piece.color == chess.WHITE else -1)
+
+        score += coordination_score
+        
+        # --- 7. RETURN relative to current player ---
+        return score if board.turn == chess.WHITE else -score
 
     def _order_moves(self, board: chess.Board, tt_best_move: Optional[chess.Move], ply: int) -> list:
         """Orders legal moves to improve alpha-beta pruning efficiency."""
