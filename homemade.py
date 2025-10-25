@@ -414,9 +414,9 @@ class MyBot(ExampleEngine):
         # --- Transposition Table Store ---
         self.transposition_table[zobrist_key] = TTEntry(depth, best_score, tt_flag, best_move)
         return best_score
-
+    """
     def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
-        """A specialized search that only considers captures to ensure stability."""
+        A specialized search that only considers captures to ensure stability.
         self.nodes_searched += 1
         stand_pat_score = self._evaluate(board)
 
@@ -436,7 +436,83 @@ class MyBot(ExampleEngine):
                 return beta
             if score > alpha:
                 alpha = score
+        return alpha"""
+    
+    def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
+        """
+        A specialized search that only considers captures, checks, and promotions 
+        to ensure the position is stable before evaluation.
+        """
+        self.nodes_searched += 1
+        
+        # 1. Stand Pat
+        stand_pat_score = self._evaluate(board)
+
+        if stand_pat_score >= beta:
+            return beta
+        # Small delta to prevent excessive deep searching in the Quiescence. 
+        # Optional: alpha = max(alpha, stand_pat_score + QUIESCENCE_DELTA)
+        if alpha < stand_pat_score:
+            alpha = stand_pat_score
+
+        # 2. Identify Forcing Moves (Captures, Checks, Promotions)
+        forcing_moves = []
+        
+        for move in board.legal_moves:
+            # Check if it's a capture
+            if board.is_capture(move):
+                forcing_moves.append(move)
+                continue
+
+            # Check for promotions (which are highly forcing, even non-captures)
+            if move.promotion is not None:
+                forcing_moves.append(move)
+                continue
+
+            # Check for checks (non-capture checks are critical threats)
+            board.push(move)
+            is_check = board.is_check()
+            board.pop()
+            
+            if is_check:
+                forcing_moves.append(move)
+                
+        # 3. Order the Forcing Moves
+        # Captures are still prioritized using MVV/LVA. Non-captures get a base bonus.
+        ordered_moves = sorted(
+            forcing_moves, 
+            key=lambda m: self._get_quiesce_score(board, m), 
+            reverse=True
+        )
+        
+        # 4. Search Loop
+        for move in ordered_moves:
+            board.push(move)
+            score = -self._quiescence(board, -beta, -alpha)
+            board.pop()
+            
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+                
         return alpha
+
+# You will need to add this new helper function to your class:
+    def _get_quiesce_score(self, board: chess.Board, move: chess.Move) -> int:
+        """Scores moves for quiescence: Captures (MVV/LVA) > Promotions > Checks."""
+        
+        if board.is_capture(move):
+            # High priority for MVV/LVA captured moves
+            return self._mvv_lva_score(board, move) + 1000 
+        
+        if move.promotion is not None:
+            # High priority for promotions (value of the promoted piece)
+            return self.PIECE_VALUES[move.promotion] + 500
+            
+        # Check if the move is a check (already verified if it's in forcing_moves)
+        # Give checks a medium bonus.
+        return 100
 
     ## ------------------------ ##
     ## EVALUATION & HEURISTICS  ##
