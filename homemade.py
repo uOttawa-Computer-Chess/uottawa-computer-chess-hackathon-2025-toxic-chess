@@ -119,6 +119,39 @@ class MyBot(ExampleEngine):
     iterative deepening, quiescence search, move ordering (MVV/LVA, history),
     transposition table, and a richer evaluator to make it competitive.
     """
+########################### ADDED ####################
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Search structures
+        self.transposition_table: Dict[int, TTEntry] = {}
+        self.killer_moves = [[None, None] for _ in range(MAX_DEPTH)]
+        self.nodes_searched = 0
+        self.start_time = 0.0
+        self.stop_time = 0.0
+
+        # Training / RL parameters
+        self.train = False               # enable training mode
+        self.epsilon = 0.1               # exploration probability when training (epsilon-greedy)
+        self.lr = 1e-4                   # learning rate for weight updates
+        self._training_positions = []    # list of (feature_vector, player_color) recorded during a game
+
+        # Linear evaluation: weights correspond to feature vector returned by _extract_features
+        # Initialize weights so initial value matches current static evaluator roughly
+        self._init_evaluation_tables()
+        # features: [pawn_feat, knight_feat, bishop_feat, rook_feat, queen_feat, king_feat, pst_sum]
+        # initialize weights with scaled PIECE_VALUES and 1.0 for PST scaling
+        self.weights = [
+            self.PIECE_VALUES[chess.PAWN],
+            self.PIECE_VALUES[chess.KNIGHT],
+            self.PIECE_VALUES[chess.BISHOP],
+            self.PIECE_VALUES[chess.ROOK],
+            self.PIECE_VALUES[chess.QUEEN],
+            self.PIECE_VALUES[chess.KING],
+            1.0
+        ]
+##################################################
+
 
     def search(self, board: chess.Board, *args: HOMEMADE_ARGS_TYPE) -> PlayResult:
         # NOTE: The sections below are intentionally simple to keep the example short.
